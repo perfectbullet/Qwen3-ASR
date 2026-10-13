@@ -25,10 +25,12 @@ Open:
   http://127.0.0.1:7860
 """
 import argparse
+import copy
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from threading import RLock
+from typing import Dict, List, Optional
 
 import numpy as np
 from flask import Flask, Response, jsonify, request
@@ -40,14 +42,21 @@ class Session:
     state: object
     created_at: float
     last_seen: float
+    completed_text: List[str] = field(default_factory=list)
+    languages: List[str] = field(default_factory=list)
+    segments_completed: int = 0
+    total_samples: int = 0
 
 
 app = Flask(__name__)
 
 global asr
-global UNFIXED_CHUNK_NUM
-global UNFIXED_TOKEN_NUM
-global CHUNK_SIZE_SEC
+UNFIXED_CHUNK_NUM = 4
+UNFIXED_TOKEN_NUM = 5
+CHUNK_SIZE_SEC = 1.0
+SEGMENT_MAX_SEC = 30.0
+SAMPLE_RATE = 16000
+MODEL_LOCK = RLock()
 
 SESSIONS: Dict[str, Session] = {}
 SESSION_TTL_SEC = 10 * 60
@@ -58,7 +67,7 @@ def _gc_sessions():
     dead = [sid for sid, s in SESSIONS.items() if now - s.last_seen > SESSION_TTL_SEC]
     for sid in dead:
         try:
-            asr.finish_streaming_transcribe(SESSIONS[sid].state)
+            _finalize_segment(SESSIONS[sid])
         except Exception:
             pass
         SESSIONS.pop(sid, None)
@@ -70,6 +79,118 @@ def _get_session(session_id: str) -> Optional[Session]:
     if s:
         s.last_seen = time.time()
     return s
+
+
+class ContextLimitError(ValueError):
+    """Even one fresh streaming chunk cannot fit the model context."""
+
+
+def _new_state():
+    return asr.init_streaming_state(
+        unfixed_chunk_num=UNFIXED_CHUNK_NUM,
+        unfixed_token_num=UNFIXED_TOKEN_NUM,
+        chunk_size_sec=CHUNK_SIZE_SEC,
+    )
+
+
+def _segment_samples(s: Session) -> int:
+    return s.state.audio_accum.size + s.state.buffer.size
+
+
+def _context_overflow(exc: ValueError) -> bool:
+    message = str(exc).lower()
+    return "prompt" in message and "longer than the maximum model length" in message
+
+
+def _record_segment(s: Session):
+    text = getattr(s.state, "text", "") or ""
+    if text:
+        s.completed_text.append(text)
+    language = getattr(s.state, "language", "") or ""
+    if language and language not in s.languages:
+        s.languages.append(language)
+    s.segments_completed += 1
+    app.logger.info("Completed streaming segment %d (%.2fs)",
+                    s.segments_completed, _segment_samples(s) / SAMPLE_RATE)
+    s.state = _new_state()
+
+
+def _finalize_segment(s: Session):
+    if not _segment_samples(s):
+        return
+    # The upstream state replaces arrays rather than mutating them in-place.
+    # A shallow snapshot therefore restores audio consumed before validation fails.
+    before = copy.copy(s.state)
+    try:
+        asr.finish_streaming_transcribe(s.state)
+    except ValueError as exc:
+        s.state = before
+        if not _context_overflow(exc):
+            raise
+        if not before.audio_accum.size:
+            raise ContextLimitError("单个音频块已超过上下文上限，请减小 --chunk-size-sec") from exc
+        tail = before.buffer
+        s.state.buffer = np.zeros(0, dtype=np.float32)
+        _record_segment(s)
+        if tail.size:
+            _push_step(s, tail)
+            _finalize_segment(s)
+        return
+    _record_segment(s)
+
+
+def _push_step(s: Session, wav: np.ndarray):
+    before = copy.copy(s.state)
+    try:
+        asr.streaming_transcribe(wav, s.state)
+    except ValueError as exc:
+        s.state = before
+        if not _context_overflow(exc):
+            raise
+        if not before.audio_accum.size:
+            raise ContextLimitError("单个音频块已超过上下文上限，请减小 --chunk-size-sec") from exc
+        # Commit the last successful output and replay only unprocessed audio.
+        pending = np.concatenate([before.buffer, wav])
+        s.state.buffer = np.zeros(0, dtype=np.float32)
+        _record_segment(s)
+        _push_step(s, pending)
+
+
+def _feed_session(s: Session, wav: np.ndarray):
+    cap = max(1, int(SEGMENT_MAX_SEC * SAMPLE_RATE))
+    offset = 0
+    while offset < wav.size:
+        remaining = cap - _segment_samples(s)
+        if remaining <= 0:
+            _finalize_segment(s)
+            continue
+        # At most one decode per call, even when a client uploads a large chunk.
+        to_decode = s.state.chunk_size_samples - s.state.buffer.size
+        count = min(wav.size - offset, remaining, to_decode)
+        _push_step(s, wav[offset:offset + count])
+        offset += count
+        s.total_samples += count
+        samples = _segment_samples(s)
+        # Prefer a quiet boundary after half of the segment budget; force a
+        # bounded segment even for uninterrupted speech.
+        tail = s.state.audio_accum[-SAMPLE_RATE // 2:]
+        quiet = (samples >= cap // 2 and not s.state.buffer.size
+                 and tail.size == SAMPLE_RATE // 2
+                 and float(np.sqrt(np.mean(tail ** 2))) < 0.005)
+        if samples >= cap or quiet:
+            _finalize_segment(s)
+
+
+def _session_result(s: Session):
+    language = getattr(s.state, "language", "") or ""
+    languages = s.languages + ([language] if language and language not in s.languages else [])
+    return {
+        "language": ",".join(languages),
+        "text": "".join(s.completed_text) + (getattr(s.state, "text", "") or ""),
+        "segments_completed": s.segments_completed,
+        "segment_seconds": _segment_samples(s) / SAMPLE_RATE,
+        "total_audio_seconds": s.total_samples / SAMPLE_RATE,
+    }
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -232,6 +353,7 @@ INDEX_HTML = r"""<!doctype html>
 
   let buf = new Float32Array(0);
   let pushing = false;
+  let pumpTask = null;
 
   function setStatus(text, cls){
     statusEl.textContent = text;
@@ -311,7 +433,12 @@ INDEX_HTML = r"""<!doctype html>
       setStatus("Starting… / 启动中…", "warn");
       lockUI(true);
 
-      await apiStart();
+      if (!window.isSecureContext){
+        throw new Error("麦克风需要安全连接，请使用 HTTPS 地址并信任证书，或通过 localhost 访问。");
+      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+        throw new Error("当前浏览器不支持麦克风访问，请使用支持 getUserMedia 的浏览器。");
+      }
 
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -322,6 +449,8 @@ INDEX_HTML = r"""<!doctype html>
         },
         video: false
       });
+
+      await apiStart();
 
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       source = audioCtx.createMediaStreamSource(mediaStream);
@@ -334,7 +463,7 @@ INDEX_HTML = r"""<!doctype html>
         const input = e.inputBuffer.getChannelData(0);
         const resampled = resampleLinear(input, audioCtx.sampleRate, TARGET_SR);
         buf = concatFloat32(buf, resampled);
-        if (!pushing) pump();
+        if (!pushing) pumpTask = pump();
       };
 
       source.connect(processor);
@@ -348,6 +477,9 @@ INDEX_HTML = r"""<!doctype html>
       setStatus("Start failed / 启动失败: " + err.message, "err");
       lockUI(false);
       running = false;
+      if (sessionId){
+        try{ await apiFinish(); }catch(cleanupError){ console.error(cleanupError); }
+      }
       sessionId = null;
       await stopAudioPipeline();
     }
@@ -387,7 +519,13 @@ INDEX_HTML = r"""<!doctype html>
     await stopAudioPipeline();
 
     try{
+      if (pumpTask) await pumpTask;
       if (sessionId){
+        if (buf.length){
+          const tail = buf;
+          buf = new Float32Array(0);
+          await apiPushChunk(tail);
+        }
         const j = await apiFinish();
         langEl.textContent = j.language || "—";
         textEl.textContent = j.text || "";
@@ -416,23 +554,17 @@ def index():
 
 @app.post("/api/start")
 def api_start():
-    session_id = uuid.uuid4().hex
-    state = asr.init_streaming_state(
-        unfixed_chunk_num=UNFIXED_CHUNK_NUM,
-        unfixed_token_num=UNFIXED_TOKEN_NUM,
-        chunk_size_sec=CHUNK_SIZE_SEC,
-    )
-    now = time.time()
-    SESSIONS[session_id] = Session(state=state, created_at=now, last_seen=now)
+    with MODEL_LOCK:
+        _gc_sessions()
+        session_id = uuid.uuid4().hex
+        now = time.time()
+        SESSIONS[session_id] = Session(state=_new_state(), created_at=now, last_seen=now)
     return jsonify({"session_id": session_id})
 
 
 @app.post("/api/chunk")
 def api_chunk():
     session_id = request.args.get("session_id", "")
-    s = _get_session(session_id)
-    if not s:
-        return jsonify({"error": "invalid session_id"}), 400
 
     if request.mimetype != "application/octet-stream":
         return jsonify({"error": "expect application/octet-stream"}), 400
@@ -442,30 +574,34 @@ def api_chunk():
         return jsonify({"error": "float32 bytes length not multiple of 4"}), 400
 
     wav = np.frombuffer(raw, dtype=np.float32).reshape(-1)
+    if not np.isfinite(wav).all():
+        return jsonify({"error": "audio contains non-finite samples"}), 400
 
-    asr.streaming_transcribe(wav, s.state)
-
-    return jsonify(
-        {
-            "language": getattr(s.state, "language", "") or "",
-            "text": getattr(s.state, "text", "") or "",
-        }
-    )
+    with MODEL_LOCK:
+        s = _get_session(session_id)
+        if not s:
+            return jsonify({"error": "invalid session_id"}), 400
+        try:
+            _feed_session(s, wav)
+        except ContextLimitError as exc:
+            return jsonify({"error": str(exc)}), 422
+        return jsonify(_session_result(s))
 
 
 @app.post("/api/finish")
 def api_finish():
     session_id = request.args.get("session_id", "")
-    s = _get_session(session_id)
-    if not s:
-        return jsonify({"error": "invalid session_id"}), 400
-
-    asr.finish_streaming_transcribe(s.state)
-    out = {
-        "language": getattr(s.state, "language", "") or "",
-        "text": getattr(s.state, "text", "") or "",
-    }
-    SESSIONS.pop(session_id, None)
+    with MODEL_LOCK:
+        s = _get_session(session_id)
+        if not s:
+            return jsonify({"error": "invalid session_id"}), 400
+        try:
+            _finalize_segment(s)
+            out = _session_result(s)
+        except ContextLimitError as exc:
+            return jsonify({"error": str(exc)}), 422
+        finally:
+            SESSIONS.pop(session_id, None)
     return jsonify(out)
 
 
@@ -475,11 +611,21 @@ def parse_args():
     p.add_argument("--host", default="0.0.0.0", help="Bind host")
     p.add_argument("--port", type=int, default=8000, help="Bind port")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.8, help="vLLM GPU memory utilization")
+    p.add_argument("--max-model-len", type=int, default=None, help="vLLM context length (e.g. 8192)")
+    p.add_argument("--ssl-certfile", default=None, help="HTTPS certificate file")
+    p.add_argument("--ssl-keyfile", default=None, help="HTTPS private key file")
 
     p.add_argument("--unfixed-chunk-num", type=int, default=4)
     p.add_argument("--unfixed-token-num", type=int, default=5)
     p.add_argument("--chunk-size-sec", type=float, default=1.0)
-    return p.parse_args()
+    p.add_argument("--segment-max-sec", type=float, default=30.0,
+                   help="Reset streaming state at this audio duration, preserving transcript")
+    args = p.parse_args()
+    if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
+        p.error("--ssl-certfile 和 --ssl-keyfile 必须同时指定")
+    if not 0 < args.chunk_size_sec <= args.segment_max_sec <= 30:
+        p.error("需要 0 < --chunk-size-sec <= --segment-max-sec <= 30")
+    return args
 
 
 def main():
@@ -489,18 +635,31 @@ def main():
     global UNFIXED_CHUNK_NUM
     global UNFIXED_TOKEN_NUM
     global CHUNK_SIZE_SEC
+    global SEGMENT_MAX_SEC
 
     UNFIXED_CHUNK_NUM = args.unfixed_chunk_num
     UNFIXED_TOKEN_NUM = args.unfixed_token_num
     CHUNK_SIZE_SEC = args.chunk_size_sec
+    SEGMENT_MAX_SEC = args.segment_max_sec
 
     asr = Qwen3ASRModel.LLM(
         model=args.asr_model_path,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
         max_new_tokens=32,
     )
     print("Model loaded.")
-    app.run(host=args.host, port=args.port, debug=False, use_reloader=False, threaded=True)
+    if args.ssl_certfile:
+        # Async TLS handshakes prevent an idle browser connection from blocking
+        # all clients in Werkzeug's development HTTPS listener.
+        import uvicorn
+        from uvicorn.middleware.wsgi import WSGIMiddleware
+
+        uvicorn.run(WSGIMiddleware(app), host=args.host, port=args.port,
+                    ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile,
+                    lifespan="off")
+    else:
+        app.run(host=args.host, port=args.port, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":
